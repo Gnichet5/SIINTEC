@@ -1,0 +1,7 @@
+gym
+stable-baselines3
+optuna
+psutil
+pynvml
+plotly
+streamlit
