@@ -39,30 +39,38 @@ class ConvergenceLogger(BaseCallback):
             # Realiza n_eval_episodes para obter uma média mais robusta
             for _ in range(self.n_eval_episodes):
                 episode_reward = 0
-                # Reset do ambiente: para VecEnv, apenas um reset() global
-                # Para ambiente único, env.reset() retorna (obs, info)
-                obs, info = self.model.env.reset() if not isinstance(self.model.env, VecEnv) else self.model.env.reset()
                 
-                terminated = [False] * self.model.env.num_envs if isinstance(self.model.env, VecEnv) else False
-                truncated = [False] * self.model.env.num_envs if isinstance(self.model.env, VecEnv) else False
+                # O reset da VecEnv retorna apenas observações
+                # Para ambientes únicos, retorna (obs, info)
+                if isinstance(self.model.env, VecEnv):
+                    obs = self.model.env.reset()
+                else:
+                    obs, info = self.model.env.reset()
                 
-                # Loop para um único episódio de avaliação
-                while not (isinstance(self.model.env, VecEnv) and all(terminated) and all(truncated)) and \
-                      not (not isinstance(self.model.env, VecEnv) and terminated and truncated): # Condição de parada flexível
+                # Para VecEnv, 'dones' é um array de booleanos. Para ambiente único, é um booleano.
+                dones = [False] * self.model.env.num_envs if isinstance(self.model.env, VecEnv) else False
+                steps = 0
+                max_steps_eval = 200 # Limite de passos para a avaliação do callback para evitar loops infinitos
+
+                # Loop para um único episódio de avaliação (ou simulação de um)
+                while not (isinstance(self.model.env, VecEnv) and all(dones)) and \
+                      not (not isinstance(self.model.env, VecEnv) and dones) and \
+                      steps < max_steps_eval:
                     
                     action, _ = self.model.predict(obs, deterministic=True)
-                    next_obs, reward, next_terminated, next_truncated, info = self.model.env.step(action)
                     
+                    # VecEnv.step() retorna (obs, reward, dones, infos) - 4 valores
+                    # Ambiente único .step() retorna (obs, reward, terminated, truncated, info) - 5 valores
+                    if isinstance(self.model.env, VecEnv):
+                        obs, reward, dones, info = self.model.env.step(action)
+                    else:
+                        obs, reward, terminated, truncated, info = self.model.env.step(action)
+                        dones = terminated or truncated # Para consistência com a lógica de parada
+
                     # Acumula a recompensa: se for VecEnv, soma a média das recompensas de todos os ambientes
                     episode_reward += np.mean(reward) if isinstance(reward, np.ndarray) else reward
                     
-                    obs = next_obs
-                    terminated = next_terminated
-                    truncated = next_truncated
-                    
-                    # Se um ambiente único terminou, saia do loop do episódio
-                    if not isinstance(self.model.env, VecEnv) and (terminated or truncated):
-                        break
+                    steps += 1
 
                 eval_rewards.append(episode_reward)
 

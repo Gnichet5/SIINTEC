@@ -78,7 +78,6 @@ try:
 
     convergence_data_list = []
     configs = ["base", "parallel", "optuna"]
-    # Assumimos que NUM_RUNS é 3 para todos, mas o ideal seria ler do CSV se variasse
     num_runs_expected = 3 
 
     for config in configs:
@@ -90,14 +89,11 @@ try:
                 df_conv["config"] = config
                 df_conv["run"] = run_idx
                 convergence_data_list.append(df_conv)
-            # else: # Descomente para debug se arquivos não forem encontrados
-            #     st.warning(f"Arquivo de log de convergência não encontrado: {log_path}")
     
     if convergence_data_list:
         all_convergence_data = pd.concat(convergence_data_list)
         
         # Calcular a média e o desvio padrão da recompensa por timesteps para cada configuração
-        # Agrupa por configuração e timesteps para calcular média/std entre as runs
         mean_convergence = all_convergence_data.groupby(['config', 'timesteps']).agg(
             mean_reward=('mean_reward', 'mean'),
             std_reward=('mean_reward', 'std')
@@ -105,7 +101,6 @@ try:
 
         fig_conv = go.Figure()
 
-        # Define as cores para as configurações
         colors = {
             "base": px.colors.qualitative.Plotly[0],
             "parallel": px.colors.qualitative.Plotly[1],
@@ -115,7 +110,6 @@ try:
         for config in configs:
             config_data = mean_convergence[mean_convergence['config'] == config]
             
-            # Linha da média
             fig_conv.add_trace(go.Scatter(
                 x=config_data['timesteps'], 
                 y=config_data['mean_reward'], 
@@ -124,8 +118,6 @@ try:
                 line=dict(width=2, color=colors[config])
             ))
             
-            # Preencher a área do desvio padrão
-            # Assegura que o array esteja na ordem correta para preenchimento
             timesteps_fill = config_data['timesteps'].tolist() + config_data['timesteps'].iloc[::-1].tolist()
             upper_bound = (config_data['mean_reward'] + config_data['std_reward']).tolist()
             lower_bound_reversed = (config_data['mean_reward'] - config_data['std_reward']).iloc[::-1].tolist()
@@ -134,7 +126,7 @@ try:
                 x=timesteps_fill, 
                 y=upper_bound + lower_bound_reversed, 
                 fill='toself',
-                fillcolor=colors[config] + '30', # Cor semitransparente
+                fillcolor=colors[config] + '30', 
                 line=dict(color='rgba(255,255,255,0)'),
                 hoverinfo="skip",
                 showlegend=False

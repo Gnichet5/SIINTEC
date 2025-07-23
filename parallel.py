@@ -1,108 +1,108 @@
 import os
 import random
 import numpy as np
-import gymnasium as gym # Usar gymnasium
+import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import CallbackList # Para múltiplos callbacks
+from stable_baselines3.common.vec_env import DummyVecEnv 
+from stable_baselines3.common.callbacks import CallbackList
 from custom_env.temp_control_env import TempControlEnv
-from utils.metrics import start_timer, end_timer, get_cpu_usage, get_gpu_usage
-from utils.convergence_callback import ConvergenceLogger # Importa o novo callback
+from utils.metrics import start_timer, end_timer
+from utils.convergence_callback import ConvergenceLogger
+from utils.cpu_gpu_callback import CPU_GPU_Logger
 import csv
+import time
 
 # --- Configurações do Experimento ---
-NUM_RUNS = 3 # Rodar cada configuração 3 vezes para robustez estatística
-NUM_ENVS = 4 # Número de ambientes paralelos
-TOTAL_TIMESTEPS = 10000 # Total de timesteps para o treinamento
-EVAL_EPISODES = 10 # Número de episódios para avaliação final após o treinamento
-EVAL_FREQ_CONVERGENCE = 100 # Frequência de avaliação para o gráfico de convergência
+NUM_RUNS = 5
+NUM_ENVS = 4
+TOTAL_TIMESTEPS = 100_000
+EVAL_EPISODES = 10
+EVAL_FREQ_CONVERGENCE = 10_000
 
-# Garante que o diretório de logs exista
 os.makedirs("logs", exist_ok=True)
-
-# --- Configuração do CSV Principal ---
 csv_header = ["config", "run", "reward_mean", "reward_std", "time", "cpu_mean", "gpu_mean"]
 
-with open("logs/parallel.csv", "w", newline="") as file:
-    writer = csv.writer(file)
-    writer.writerow(csv_header)
+def make_env_fn(seed):
+    def _init():
+        env = TempControlEnv()
+        env.reset(seed=seed)
+        return env
+    return _init
 
-    for run_idx in range(NUM_RUNS):
-        # --- Gerenciamento de Seeds para Reprodutibilidade ---
-        seed = 42 + run_idx
-        np.random.seed(seed)
-        random.seed(seed)
+def run_parallel_experiment():
+    with open("logs/debug_dummy.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(csv_header)
 
-        print(f"\n--- Parallel Run {run_idx + 1}/{NUM_RUNS} (Seed: {seed}) ---")
+        for run_idx in range(NUM_RUNS):
+            seed = 42 + run_idx
+            np.random.seed(seed)
+            random.seed(seed)
 
-        # --- Função para criar o ambiente (necessário para VecEnv) ---
-        def make_env_fn(env_seed): # Renomeado para evitar conflitos
-            def _init():
-                env = TempControlEnv()
-                # A seed para o ambiente individual é definida no reset.
-                # Para VecEnv, a seed é passada para o modelo SB3 que a distribui.
-                return env
-            return _init
+            print(f"\n[RUN {run_idx + 1}] Seed: {seed} - Inicializando ambientes...")
+            t_env_start = time.perf_counter()
+            env_fns = [make_env_fn(seed + i) for i in range(NUM_ENVS)]
+            vec_env = DummyVecEnv(env_fns)
+            t_env_end = time.perf_counter()
+            print(f"[RUN {run_idx + 1}] Ambientes criados em {t_env_end - t_env_start:.2f}s")
 
-        # --- Instanciação do Ambiente Paralelo e Modelo ---
-        # Cria uma lista de funções que instanciam o ambiente
-        env_fns = [make_env_fn(seed + i) for i in range(NUM_ENVS)]
-        vec_env = SubprocVecEnv(env_fns, start_method='fork') # 'fork' pode ser mais eficiente no Linux
+            model = PPO("MlpPolicy", vec_env, verbose=1, seed=seed)
 
-        model = PPO("MlpPolicy", vec_env, verbose=0, seed=seed) # Definir seed para o modelo PPO
+            cpu_gpu_callback = CPU_GPU_Logger()
+            convergence_log_dir = os.path.join("logs", f"debug_run_{run_idx+1}")
+            convergence_callback = ConvergenceLogger(
+                log_dir=convergence_log_dir,
+                eval_freq=EVAL_FREQ_CONVERGENCE,
+                n_eval_episodes=EVAL_EPISODES
+            )
+            callback = CallbackList([cpu_gpu_callback, convergence_callback])
 
-        # --- Callbacks para Coleta de Métricas ---
-        cpu_usages_during_train = []
-        gpu_usages_during_train = []
+            print(f"[RUN {run_idx + 1}] Iniciando treinamento...")
+            t_train_start = time.perf_counter()
+            model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
+            t_train_end = time.perf_counter()
+            train_duration = t_train_end - t_train_start
+            print(f"[RUN {run_idx + 1}] Treinamento concluído em {train_duration:.2f}s")
 
-        def cpu_gpu_monitor_callback(_locals, _globals):
-            cpu_usages_during_train.append(get_cpu_usage())
-            gpu_usages_during_train.append(get_gpu_usage())
-            return True
+            # Avaliação
+            print(f"[RUN {run_idx + 1}] Iniciando avaliação...")
+            t_eval_start = time.perf_counter()
+            episode_rewards_final = []
 
-        # Callback para registrar a convergência do treinamento
-        convergence_log_dir = os.path.join("logs", f"parallel_run_{run_idx+1}")
-        convergence_callback = ConvergenceLogger(
-            log_dir=convergence_log_dir, 
-            eval_freq=EVAL_FREQ_CONVERGENCE, 
-            n_eval_episodes=EVAL_EPISODES
-        )
+            for ep in range(EVAL_EPISODES):
+                obs = vec_env.reset()
+                episode_reward = 0
+                dones = [False] * NUM_ENVS
+                steps = 0
+                ep_start = time.perf_counter()
 
-        callback = CallbackList([cpu_gpu_monitor_callback, convergence_callback])
+                while not all(dones):
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, reward, dones, _ = vec_env.step(action)
+                    episode_reward += reward.mean()
+                    steps += 1
+                    if steps % 50 == 0:
+                        print(f"[RUN {run_idx + 1}] Avaliação EP {ep+1}: {steps} passos...")
 
-        # --- Treinamento do Agente ---
-        train_start_time = start_timer()
-        model.learn(
-            total_timesteps=TOTAL_TIMESTEPS, 
-            callback=callback
-        )
-        duration = end_timer(train_start_time)
+                ep_end = time.perf_counter()
+                print(f"[RUN {run_idx + 1}] Episódio {ep+1} recompensa média: {episode_reward:.2f} (tempo: {ep_end - ep_start:.2f}s)")
+                episode_rewards_final.append(episode_reward)
 
-        # --- Avaliação Final do Agente ---
-        episode_rewards_final = []
-        for eval_episode in range(EVAL_EPISODES):
-            # Reset da VecEnv. A seed para os ambientes individuais dentro da VecEnv
-            # é gerenciada pelo modelo SB3 se ele tiver sido inicializado com uma seed.
-            obs, info = vec_env.reset() 
-            episode_reward = 0
-            terminated = [False] * NUM_ENVS
-            truncated = [False] * NUM_ENVS
-            # Loop de avaliação enquanto houver ambientes ativos
-            while not all(terminated) and not all(truncated): 
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = vec_env.step(action)
-                episode_reward += reward.mean() # Soma a média das recompensas de todos os ambientes
-            episode_rewards_final.append(episode_reward)
-        
-        mean_reward_final = np.mean(episode_rewards_final)
-        std_reward_final = np.std(episode_rewards_final)
+            t_eval_end = time.perf_counter()
+            eval_duration = t_eval_end - t_eval_start
 
-        # Calcula a média do uso de CPU/GPU durante o treinamento
-        mean_cpu = np.mean(cpu_usages_during_train) if cpu_usages_during_train else 0
-        mean_gpu = np.mean(gpu_usages_during_train) if gpu_usages_during_train else 0
+            mean_reward_final = np.mean(episode_rewards_final)
+            std_reward_final = np.std(episode_rewards_final)
+            mean_cpu = cpu_gpu_callback.get_mean_cpu_usage()
+            mean_gpu = cpu_gpu_callback.get_mean_gpu_usage()
 
-        # --- Escreve os Resultados no CSV ---
-        writer.writerow(["parallel", run_idx + 1, mean_reward_final, std_reward_final, duration, mean_cpu, mean_gpu])
-        vec_env.close()
+            writer.writerow(["debug_dummy", run_idx + 1, mean_reward_final, std_reward_final, train_duration, mean_cpu, mean_gpu])
+            vec_env.close()
 
-print("\nParallel experiments completed and logged.")
+            print(f"[RUN {run_idx + 1}] Finalizado. Treino: {train_duration:.2f}s | Avaliação: {eval_duration:.2f}s | Média recompensa: {mean_reward_final:.2f} | CPU: {mean_cpu:.1f}%, GPU: {mean_gpu:.1f}%")
+
+    print("\nTodos os experimentos foram concluídos.")
+
+
+if __name__ == "__main__":
+    run_parallel_experiment()
