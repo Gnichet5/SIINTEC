@@ -1,67 +1,150 @@
 import os
-import random
+import time
+import json
+import optuna
 import numpy as np
 from stable_baselines3 import PPO
-from custom_env.temp_control_env import TempControlEnv
-from utils.metrics import start_timer, end_timer, get_cpu_usage, get_gpu_usage
-import csv
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.evaluation import evaluate_policy
 
-NUM_RUNS = 3
-TOTAL_TIMESTEPS = 10_000
-EVAL_EPISODES = 10
-SEED_BASE = 42
+# Assumindo que seu arquivo de ambiente está na mesma pasta ou em um local acessível
+try:
+    from custom_env.temp_control_env import TempControlEnv
+except ImportError:
+    print("Erro: Verifique se o arquivo 'temp_control_env.py' está no mesmo diretório.")
+    exit()
 
-os.makedirs("logs", exist_ok=True)
+# --- 1. CONFIGURAÇÕES DO EXPERIMENTO ---
 
-csv_header = ["config", "run", "reward_mean", "reward_std", "time", "cpu_mean", "gpu_mean"]
+# Configurações para a busca do Optuna
+N_TRIALS = 50  # Número de tentativas que o Optuna fará
+N_TIMESTEPS_TRIAL = 10_000 # Passos de treino para cada tentativa (menor para ser mais rápido)
 
-with open("logs/base.csv", "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(csv_header)
+# Configurações para a avaliação final (deve ser igual ao seu script base.py)
+N_TIMESTEPS_FINAL = 100_000 # Passos de treino para o modelo final
+N_EVAL_EPISODES = 10       # Número de episódios para a avaliação final
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
-    for run_idx in range(NUM_RUNS):
-        seed = SEED_BASE + run_idx
-        random.seed(seed)
-        np.random.seed(seed)
 
-        print(f"\n--- Base Run {run_idx + 1}/{NUM_RUNS} (Seed: {seed}) ---")
-
+def make_env_fn(seed: int):
+    """Função auxiliar para criar o ambiente com uma seed."""
+    def _init():
         env = TempControlEnv()
-        obs, info = env.reset(seed=seed)
+        env.reset(seed=seed)
+        return env
+    return _init
 
-        model = PPO("MlpPolicy", env, verbose=0, seed=seed)
 
-        cpu_usages = []
-        gpu_usages = []
+# --- 2. ETAPA DE OTIMIZAÇÃO COM OPTUNA ---
 
-        timer = start_timer()
-        def callback(_locals, _globals):
-            cpu_usages.append(get_cpu_usage())
-            gpu_usages.append(get_gpu_usage())
-            return True
+def objective(trial: optuna.Trial) -> float:
+    """
+    Função objetivo que o Optuna tentará maximizar.
+    Ela treina um modelo com um conjunto de hiperparâmetros e retorna sua performance.
+    """
+    print(f"\nIniciando Trial {trial.number}...")
+    
+    # Cria um ambiente vetorizado para este trial
+    vec_env = DummyVecEnv([make_env_fn(seed=int(time.time())) for _ in range(4)])
 
-        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
-        duration = end_timer(timer)
+    # Definição do espaço de busca de hiperparâmetros
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+    n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096])
+    gamma = trial.suggest_float("gamma", 0.9, 0.9999)
+    ent_coef = trial.suggest_float("ent_coef", 0.0, 0.1)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
 
-        rewards = []
-        for ep in range(EVAL_EPISODES):
-            obs, info = env.reset(seed=seed + ep)
-            done = False
-            truncated = False
-            total_reward = 0.0
-            while not done and not truncated:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, truncated, _ = env.step(action)
-                total_reward += reward
-            rewards.append(total_reward)
+    # Criação do modelo PPO com os parâmetros do trial
+    model = PPO(
+        "MlpPolicy",
+        vec_env,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        gamma=gamma,
+        ent_coef=ent_coef,
+        clip_range=clip_range,
+        verbose=0  # Silencioso para não poluir o log do Optuna
+    )
 
-        mean_reward = np.mean(rewards)
-        std_reward = np.std(rewards)
-        mean_cpu = np.mean(cpu_usages) if cpu_usages else 0
-        mean_gpu = np.mean(gpu_usages) if gpu_usages else 0
+    # Treina o modelo por um número menor de passos
+    model.learn(total_timesteps=N_TIMESTEPS_TRIAL)
 
-        writer.writerow(["base", run_idx + 1, mean_reward, std_reward, duration, mean_cpu, mean_gpu])
+    # Avalia o modelo e retorna a recompensa média
+    mean_reward, _ = evaluate_policy(model, model.get_env(), n_eval_episodes=5)
+    
+    vec_env.close()
+    
+    print(f"Trial {trial.number} finalizado com recompensa: {mean_reward:.2f}")
+    
+    return mean_reward
 
-        env.close()
 
-print("\nBase experiments completed and logged.")
+if __name__ == "__main__":
+    # Cria e executa o estudo do Optuna
+    # Usamos um banco de dados SQLite para salvar o progresso e poder resumir o estudo
+    study = optuna.create_study(
+        study_name="ppo_temp_control_optimization",
+        storage=f"sqlite:///{LOG_DIR}/optuna_study.db",
+        direction="maximize",
+        load_if_exists=True # Permite continuar um estudo anterior
+    )
+    
+    study.optimize(objective, n_trials=N_TRIALS)
+
+    print("\n" + "="*50)
+    print("Busca com Optuna concluída!")
+    print(f"Melhor recompensa (valor): {study.best_value:.2f}")
+    print(f"Melhores hiperparâmetros: {study.best_params}")
+    print("="*50 + "\n")
+
+    # --- 3. ETAPA DE AVALIAÇÃO FINAL DO MELHOR MODELO ---
+
+    print("Iniciando treinamento e avaliação final do melhor modelo...")
+
+    # Pega os melhores hiperparâmetros encontrados
+    best_params = study.best_params
+
+    # Cria um novo ambiente vetorizado para a avaliação final
+    # Usamos uma seed fixa para garantir a reprodutibilidade da avaliação
+    eval_vec_env = DummyVecEnv([make_env_fn(seed=42 + i) for i in range(4)])
+
+    # Cria o modelo final com os melhores parâmetros
+    final_model = PPO("MlpPolicy", eval_vec_env, verbose=1, **best_params)
+
+    # Treina o modelo final com o número de passos completo (igual ao base.py)
+    t_start = time.time()
+    final_model.learn(total_timesteps=N_TIMESTEPS_FINAL)
+    training_time = time.time() - t_start
+
+    # Avalia o modelo final de forma robusta
+    mean_reward, std_reward = evaluate_policy(
+        final_model, 
+        final_model.get_env(), 
+        n_eval_episodes=N_EVAL_EPISODES
+    )
+
+    eval_vec_env.close()
+
+    print("\n" + "-"*50)
+    print("Avaliação Final Concluída:")
+    print(f"  Recompensa Média: {mean_reward:.2f} +/- {std_reward:.2f}")
+    print(f"  Tempo de Treino: {training_time:.2f}s")
+    print("-" * 50)
+
+    # --- 4. SALVAMENTO DOS RESULTADOS COMPARATIVOS ---
+
+    output_path = os.path.join(LOG_DIR, "optuna_final_evaluation.csv")
+    
+    with open(output_path, "w", newline="") as file:
+        import csv
+        writer = csv.writer(file)
+        
+        # Cabeçalho para comparação direta com os resultados do 'base.py'
+        header = ["reward_mean", "reward_std", "training_time", "hyperparameters"]
+        writer.writerow(header)
+        
+        # Salva os dados
+        writer.writerow([mean_reward, std_reward, training_time, json.dumps(best_params)])
+
+    print(f"\nResultados da avaliação final salvos em: '{output_path}'")
