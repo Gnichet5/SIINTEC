@@ -17,7 +17,7 @@ except ImportError:
 # --- 1. CONFIGURAÇÕES DO EXPERIMENTO ---
 
 # Configurações para a busca do Optuna
-N_TRIALS = 50  # Número de tentativas que o Optuna fará
+N_TRIALS = 100 # Número de tentativas que o Optuna fará
 N_TIMESTEPS_TRIAL = 10_000 # Passos de treino para cada tentativa (menor para ser mais rápido)
 
 # Configurações para a avaliação final (deve ser igual ao seu script base.py)

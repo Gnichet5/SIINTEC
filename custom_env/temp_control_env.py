@@ -1,79 +1,106 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+from collections import deque
 
 class TempControlEnv(gym.Env):
     """
     Ambiente de controle de temperatura simulando um forno industrial com inércia térmica.
-    Compatível com a API Gymnasium.
+    Versão estendida com mais complexidade para experimentos de otimização.
     """
-    metadata = {"render_modes": ["human"], "render_fps": 30} # Metadados para o Gym/Gymnasium
+    metadata = {"render_modes": ["human"], "render_fps": 30}
 
     def __init__(self):
         super(TempControlEnv, self).__init__()
-        # Espaço de ação: Um valor contínuo para o controle de potência (-1.0 a 1.0)
+        # Espaço de ação: valor contínuo (-1 a 1), simula controle de potência
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        # Espaço de observação: [Temperatura Atual, Erro Instantâneo, Derivada do Erro]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
-        
-        self.setpoint = 100.0 # Temperatura alvo
-        self.temp = np.random.uniform(20, 30) # Temperatura inicial aleatória
-        self.last_error = self.setpoint - self.temp # Erro inicial
 
-        # Limite de passos por episódio para lidar com 'truncated'
-        self.max_episode_steps = 200 
-        self.current_step = 0 # Contador de passos dentro do episódio
+        # Espaço de observação expandido:
+        # [T1, T2, T3, erro, d_erro, energia, tempo_desde_pico]
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+
+        self.setpoint = 100.0
+        self.temps = np.random.uniform(20, 30, size=3)  # Temperaturas em 3 sensores
+        self.last_error = self.setpoint - np.mean(self.temps)
+        self.energy = 100.0  # energia disponível no sistema
+        self.steps_since_last_peak = 0
+
+        self.max_episode_steps = 500
+        self.current_step = 0
+
+        # Atraso da ação (inércia térmica)
+        self.action_delay = deque([0.0]*5, maxlen=5)
 
     def step(self, action):
-        """
-        Executa um passo no ambiente.
-        Retorna: observation, reward, terminated, truncated, info
-        """
         self.current_step += 1
+        self.steps_since_last_peak += 1
 
-        power = float(np.clip(action, -1, 1)) # Garante que a ação esteja no range
-        noise = np.random.normal(0, 0.3) # Ruído estocástico no processo
-        
-        # Dinâmica do forno: delta de temperatura baseado em potência, erro e ruído
-        delta = 0.1 * power - 0.05 * (self.temp - self.setpoint) + noise
-        self.temp += delta
+        power = float(np.clip(action, -1, 1))
+        self.action_delay.append(power)
+        delayed_power = self.action_delay[0]
 
-        error = self.setpoint - self.temp
+        noise = np.random.normal(0, 0.3, size=3)  # ruído individual em cada sensor
+        deltas = 0.1 * delayed_power - 0.05 * (self.temps - self.setpoint) + noise
+        self.temps += deltas
+
+        # Perturbação aleatória
+        if np.random.rand() < 0.01:
+            self.temps -= np.random.uniform(3.0, 6.0)
+            self.steps_since_last_peak = 0
+
+        avg_temp = np.mean(self.temps)
+        error = self.setpoint - avg_temp
         d_error = error - self.last_error
         self.last_error = error
 
-        obs = np.array([self.temp, error, d_error], dtype=np.float32)
-        reward = -abs(error)  # Recompensa: penaliza o erro absoluto
+        # Atualização de energia (decresce com uso)
+        self.energy -= abs(delayed_power) * 0.5
+        self.energy = max(self.energy, 0.0)
 
-        # Condições de término do episódio
-        terminated = abs(error) < 0.5 # True se o agente atingiu a temperatura alvo (erro pequeno)
-        truncated = self.current_step >= self.max_episode_steps # True se o limite de passos foi atingido
+        obs = np.array([
+            self.temps[0] + np.random.normal(0, 0.2),
+            self.temps[1] + np.random.normal(0, 0.2),
+            self.temps[2] + np.random.normal(0, 0.2),
+            error,
+            d_error,
+            self.energy,
+            float(self.steps_since_last_peak)
+        ], dtype=np.float32)
 
-        info = {} # Informações adicionais (pode ser vazio por enquanto)
+        # Recompensa penaliza erro e bonifica estabilidade prolongada
+        reward = -abs(error)
+        if abs(error) < 1.0:
+            reward += 1.0  # bônus por manter temperatura perto do alvo
+        if self.steps_since_last_peak > 50:
+            reward += 0.5  # bônus por estabilidade prolongada
 
-        return obs, reward, terminated, truncated, info
+        terminated = abs(error) < 0.3 and self.steps_since_last_peak > 30
+        truncated = self.current_step >= self.max_episode_steps
+
+        return obs, reward, terminated, truncated, {}
 
     def reset(self, seed=None, options=None):
-        """
-        Reinicia o ambiente para um novo episódio.
-        Retorna: observation, info
-        """
-        super().reset(seed=seed) # Lida com a seed para reprodutibilidade
-        
-        # Reinicia a temperatura e o erro
-        self.temp = np.random.uniform(20, 30)
-        self.last_error = self.setpoint - self.temp
-        self.current_step = 0 # Reinicia o contador de passos
+        super().reset(seed=seed)
+        self.temps = np.random.uniform(20, 30, size=3)
+        self.last_error = self.setpoint - np.mean(self.temps)
+        self.current_step = 0
+        self.energy = 100.0
+        self.steps_since_last_peak = 0
+        self.action_delay = deque([0.0]*5, maxlen=5)
 
-        obs = np.array([self.temp, self.last_error, 0.0], dtype=np.float32)
-        info = {} # Informações adicionais na reinicialização (pode ser vazio)
-
-        return obs, info
+        obs = np.array([
+            self.temps[0] + np.random.normal(0, 0.2),
+            self.temps[1] + np.random.normal(0, 0.2),
+            self.temps[2] + np.random.normal(0, 0.2),
+            self.last_error,
+            0.0,
+            self.energy,
+            0.0
+        ], dtype=np.float32)
+        return obs, {}
 
     def render(self):
-        # Implementação opcional para visualização do ambiente
         pass
 
     def close(self):
-        # Implementação opcional para fechar recursos
         pass
