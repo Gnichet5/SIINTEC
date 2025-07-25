@@ -3,148 +3,183 @@ import time
 import json
 import optuna
 import numpy as np
+import pandas as pd
+import psutil
+import pynvml
+from typing import Dict, Any, Optional
+from threading import Thread, Event
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.utils import set_random_seed
 
-# Assumindo que seu arquivo de ambiente está na mesma pasta ou em um local acessível
 try:
     from custom_env.temp_control_env import TempControlEnv
-except ImportError:
-    print("Erro: Verifique se o arquivo 'temp_control_env.py' está no mesmo diretório.")
-    exit()
+except ImportError as e:
+    raise ImportError("Erro: Arquivo 'temp_control_env.py' não encontrado na pasta 'custom_env'") from e
 
-# --- 1. CONFIGURAÇÕES DO EXPERIMENTO ---
+# ======================================================
+# CONFIGURAÇÕES GLOBAIS (sem alterações)
+# ======================================================
+class ExperimentConfig:
+    ENV_CONFIG = {"enable_matrix_calcs": True, "enable_high_precision": True}
+    N_TRIALS = 50
+    N_TIMESTEPS_TRIAL = 15_000
+    N_TIMESTEPS_FINAL = 20_000
+    N_EVAL_EPISODES = 10
+    N_ENVS = 4
+    LOG_DIR = "optuna_logs"
+    STUDY_NAME = "temp_control_optimization"
+    SQL_DB_URL = f"sqlite:///{LOG_DIR}/optuna_study.db"
+    def __init__(self):
+        os.makedirs(self.LOG_DIR, exist_ok=True)
 
-# Configurações para a busca do Optuna
-N_TRIALS = 100 # Número de tentativas que o Optuna fará
-N_TIMESTEPS_TRIAL = 10_000 # Passos de treino para cada tentativa (menor para ser mais rápido)
+# ======================================================
+# CALLBACK E FÁBRICA DE AMBIENTES 
+# ======================================================
+class CustomPruningCallback(BaseCallback):
+    def __init__(self, trial: optuna.Trial, eval_interval: int = 1000):
+        super().__init__()
+        self.trial, self.eval_interval, self.best_mean_reward = trial, eval_interval, -np.inf
+    def _on_step(self) -> bool:
+        if self.n_calls % self.eval_interval == 0 and len(self.model.ep_info_buffer) > 0:
+            current_reward = np.mean([ep['r'] for ep in self.model.ep_info_buffer])
+            self.best_mean_reward = max(self.best_mean_reward, current_reward)
+            self.trial.report(self.best_mean_reward, self.num_timesteps)
+            if self.trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+        return True
 
-# Configurações para a avaliação final (deve ser igual ao seu script base.py)
-N_TIMESTEPS_FINAL = 100_000 # Passos de treino para o modelo final
-N_EVAL_EPISODES = 10       # Número de episódios para a avaliação final
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-
-
-def make_env_fn(seed: int):
-    """Função auxiliar para criar o ambiente com uma seed."""
+def make_env(seed: int, config: Dict[str, Any]) -> callable:
     def _init():
-        env = TempControlEnv()
+        env = Monitor(TempControlEnv(config=config))
         env.reset(seed=seed)
         return env
     return _init
 
-
-# --- 2. ETAPA DE OTIMIZAÇÃO COM OPTUNA ---
-
-def objective(trial: optuna.Trial) -> float:
-    """
-    Função objetivo que o Optuna tentará maximizar.
-    Ela treina um modelo com um conjunto de hiperparâmetros e retorna sua performance.
-    """
-    print(f"\nIniciando Trial {trial.number}...")
-    
-    # Cria um ambiente vetorizado para este trial
-    vec_env = DummyVecEnv([make_env_fn(seed=int(time.time())) for _ in range(4)])
-
-    # Definição do espaço de busca de hiperparâmetros
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-    n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096])
-    gamma = trial.suggest_float("gamma", 0.9, 0.9999)
-    ent_coef = trial.suggest_float("ent_coef", 0.0, 0.1)
-    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
-
-    # Criação do modelo PPO com os parâmetros do trial
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        gamma=gamma,
-        ent_coef=ent_coef,
-        clip_range=clip_range,
-        verbose=0  # Silencioso para não poluir o log do Optuna
-    )
-
-    # Treina o modelo por um número menor de passos
-    model.learn(total_timesteps=N_TIMESTEPS_TRIAL)
-
-    # Avalia o modelo e retorna a recompensa média
-    mean_reward, _ = evaluate_policy(model, model.get_env(), n_eval_episodes=5)
-    
+def objective(trial: optuna.Trial, config: ExperimentConfig) -> float:
+    hyperparams = {
+        'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
+        'n_steps': trial.suggest_categorical('n_steps', [256, 512, 1024, 2048]),
+        'gamma': trial.suggest_float('gamma', 0.9, 0.9999),
+        'ent_coef': trial.suggest_float('ent_coef', 1e-8, 0.1, log=True),
+        'clip_range': trial.suggest_float('clip_range', 0.1, 0.4),
+        'n_epochs': trial.suggest_int('n_epochs', 1, 10),
+    }
+    vec_env = DummyVecEnv([make_env(seed=int(time.time())+i, config=config.ENV_CONFIG) for i in range(config.N_ENVS)])
+    model = PPO("MlpPolicy", vec_env, **hyperparams, verbose=0, tensorboard_log=os.path.join(config.LOG_DIR, "tensorboard"))
+    callback = CustomPruningCallback(trial)
+    try:
+        model.learn(total_timesteps=config.N_TIMESTEPS_TRIAL, callback=callback, tb_log_name=f"trial_{trial.number}")
+    except optuna.exceptions.TrialPruned:
+        vec_env.close()
+        raise
+    mean_reward, _ = evaluate_policy(model, vec_env, n_eval_episodes=config.N_EVAL_EPISODES)
     vec_env.close()
-    
-    print(f"Trial {trial.number} finalizado com recompensa: {mean_reward:.2f}")
-    
-    return mean_reward
+    print(f"✅ Trial {trial.number} concluído | Recompensa: {mean_reward:.2f}")
+    return float(mean_reward)
 
+# ======================================================
+# ---  LÓGICA DE MONITORAMENTO ATUALIZADA ---
+# ======================================================
+def monitor_worker(monitor, stop_event):
+    """Função que roda em uma thread para coletar dados periodicamente."""
+    while not stop_event.is_set():
+        monitor.update()
+        time.sleep(1.0) # Intervalo de coleta
+
+def evaluate_final_model(study: optuna.Study, config: ExperimentConfig) -> Dict[str, Any]:
+    print("\n" + "="*50 + "\nAvaliando melhor modelo...")
+    
+    eval_env = DummyVecEnv([make_env(seed=42+i, config=config.ENV_CONFIG) for i in range(config.N_ENVS)])
+    monitor = ResourceMonitor(os.getpid())
+    stop_event = Event()
+    
+    with monitor: 
+        monitor_thread = Thread(target=monitor_worker, args=(monitor, stop_event))
+        monitor_thread.start()
+
+        start_time = time.time()
+        model = PPO("MlpPolicy", eval_env, **study.best_params, verbose=1, tensorboard_log=os.path.join(config.LOG_DIR, "tensorboard"))
+        model.learn(total_timesteps=config.N_TIMESTEPS_FINAL, tb_log_name="final_model")
+        training_time = time.time() - start_time
+        stop_event.set()
+        monitor_thread.join()
+
+    mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=config.N_EVAL_EPISODES * 2)
+    eval_env.close()
+    resource_stats = monitor.get_stats()
+
+    results = {
+        'config': 'optuna_heavy',
+        'reward_mean': float(mean_reward), 'reward_std': float(std_reward),
+        'time': training_time,
+        'cpu_mean': resource_stats['cpu_mean'], 'gpu_mean': resource_stats['gpu_mean'],
+        'hyperparameters': json.dumps(study.best_params),
+    }
+    
+    print("\n" + "="*50 + "\nResultados Finais:")
+    print(f"Recompensa: {results['reward_mean']:.2f} ± {results['reward_std']:.2f}")
+    print(f"Tempo: {results['time']:.2f}s | CPU: {results['cpu_mean']:.1f}% | GPU: {results['gpu_mean']:.1f}%")
+    print("="*50)
+    
+    return results
+
+# ======================================================
+# --- CLASSE ResourceMonitor  ---
+# ======================================================
+class ResourceMonitor:
+    def __init__(self, process_id: int):
+        self.process = psutil.Process(process_id)
+        self.cpu_usage, self.gpu_usage = [], []
+        self.gpu_available, self.handle = False, None
+    def __enter__(self):
+        try:
+            pynvml.nvmlInit()
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            self.gpu_available = True
+            print("Monitoramento de GPU ativado.")
+        except pynvml.NVMLError:
+            print("Monitoramento de GPU não disponível.")
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.gpu_available: pynvml.nvmlShutdown()
+    def update(self):
+        try:
+            self.cpu_usage.append(self.process.cpu_percent())
+            if self.gpu_available:
+                self.gpu_usage.append(pynvml.nvmlDeviceGetUtilizationRates(self.handle).gpu)
+        except (psutil.NoSuchProcess, pynvml.NVMLError): pass
+    def get_stats(self) -> Dict[str, float]:
+        return {
+            'cpu_mean': np.mean(self.cpu_usage) if self.cpu_usage else 0,
+            'gpu_mean': np.mean(self.gpu_usage) if self.gpu_usage else 0,
+        }
+
+# ======================================================
+# FUNÇÃO PRINCIPAL 
+# ======================================================
+def main():
+    config = ExperimentConfig()
+    set_random_seed(42)
+    study = optuna.create_study(
+        study_name=config.STUDY_NAME, storage=config.SQL_DB_URL,
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
+        direction="maximize", load_if_exists=True
+    )
+    print(f"\n🚀 Iniciando otimização com {config.N_TRIALS} trials")
+    study.optimize(lambda trial: objective(trial, config), n_trials=config.N_TRIALS, show_progress_bar=True)
+    
+    results = evaluate_final_model(study, config)
+    
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    results_file = os.path.join(config.LOG_DIR, f"results_{timestamp}.csv")
+    pd.DataFrame([results]).to_csv(results_file, index=False)
+    
+    print(f"\n📊 Resultados salvos em: {results_file}")
+    print(f"⭐ Melhor recompensa do estudo: {study.best_value:.2f}")
 
 if __name__ == "__main__":
-    # Cria e executa o estudo do Optuna
-    # Usamos um banco de dados SQLite para salvar o progresso e poder resumir o estudo
-    study = optuna.create_study(
-        study_name="ppo_temp_control_optimization",
-        storage=f"sqlite:///{LOG_DIR}/optuna_study.db",
-        direction="maximize",
-        load_if_exists=True # Permite continuar um estudo anterior
-    )
-    
-    study.optimize(objective, n_trials=N_TRIALS)
-
-    print("\n" + "="*50)
-    print("Busca com Optuna concluída!")
-    print(f"Melhor recompensa (valor): {study.best_value:.2f}")
-    print(f"Melhores hiperparâmetros: {study.best_params}")
-    print("="*50 + "\n")
-
-    # --- 3. ETAPA DE AVALIAÇÃO FINAL DO MELHOR MODELO ---
-
-    print("Iniciando treinamento e avaliação final do melhor modelo...")
-
-    # Pega os melhores hiperparâmetros encontrados
-    best_params = study.best_params
-
-    # Cria um novo ambiente vetorizado para a avaliação final
-    # Usamos uma seed fixa para garantir a reprodutibilidade da avaliação
-    eval_vec_env = DummyVecEnv([make_env_fn(seed=42 + i) for i in range(4)])
-
-    # Cria o modelo final com os melhores parâmetros
-    final_model = PPO("MlpPolicy", eval_vec_env, verbose=1, **best_params)
-
-    # Treina o modelo final com o número de passos completo (igual ao base.py)
-    t_start = time.time()
-    final_model.learn(total_timesteps=N_TIMESTEPS_FINAL)
-    training_time = time.time() - t_start
-
-    # Avalia o modelo final de forma robusta
-    mean_reward, std_reward = evaluate_policy(
-        final_model, 
-        final_model.get_env(), 
-        n_eval_episodes=N_EVAL_EPISODES
-    )
-
-    eval_vec_env.close()
-
-    print("\n" + "-"*50)
-    print("Avaliação Final Concluída:")
-    print(f"  Recompensa Média: {mean_reward:.2f} +/- {std_reward:.2f}")
-    print(f"  Tempo de Treino: {training_time:.2f}s")
-    print("-" * 50)
-
-    # --- 4. SALVAMENTO DOS RESULTADOS COMPARATIVOS ---
-
-    output_path = os.path.join(LOG_DIR, "optuna_final_evaluation.csv")
-    
-    with open(output_path, "w", newline="") as file:
-        import csv
-        writer = csv.writer(file)
-        
-        # Cabeçalho para comparação direta com os resultados do 'base.py'
-        header = ["reward_mean", "reward_std", "training_time", "hyperparameters"]
-        writer.writerow(header)
-        
-        # Salva os dados
-        writer.writerow([mean_reward, std_reward, training_time, json.dumps(best_params)])
-
-    print(f"\nResultados da avaliação final salvos em: '{output_path}'")
+    main()

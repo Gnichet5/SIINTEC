@@ -1,6 +1,0 @@
-experiment_type,run,reward_mean,reward_std,training_time,cpu_mean,gpu_mean,hyperparameters
-parallel_ppo,1,-1515.4770531432237,110.93947026013389,207.14227747917175,6.395196063701923,0.0,"{""learning_rate"": 0.0003, ""n_steps"": 2048, ""batch_size"": 64, ""gamma"": 0.99, ""ent_coef"": 0.0}"
-parallel_ppo,2,-1442.0220779874362,147.3462263479234,101.28129601478577,3.672081580528846,0.0,"{""learning_rate"": 0.0003, ""n_steps"": 2048, ""batch_size"": 64, ""gamma"": 0.99, ""ent_coef"": 0.0}"
-parallel_ppo,3,-1466.2444322261958,125.01425925984567,94.39965152740479,3.797096604567308,0.0,"{""learning_rate"": 0.0003, ""n_steps"": 2048, ""batch_size"": 64, ""gamma"": 0.99, ""ent_coef"": 0.0}"
-parallel_ppo,4,-1472.7985718727111,113.35138369434124,96.22048807144165,3.7840407151442315,0.0,"{""learning_rate"": 0.0003, ""n_steps"": 2048, ""batch_size"": 64, ""gamma"": 0.99, ""ent_coef"": 0.0}"
-parallel_ppo,5,-1495.5761280523147,157.13348677370544,95.09814453125,3.825356820913462,0.0,"{""learning_rate"": 0.0003, ""n_steps"": 2048, ""batch_size"": 64, ""gamma"": 0.99, ""ent_coef"": 0.0}"

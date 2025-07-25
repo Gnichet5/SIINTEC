@@ -1,72 +1,92 @@
-from stable_baselines3 import PPO
-from custom_env.temp_control_env import TempControlEnv
-from utils.metrics import *
-import csv
-import numpy as np
-import random
 import os
+import time
+import pandas as pd
+import psutil
+import pynvml
+from multiprocessing import Process, Queue
+from stable_baselines3 import PPO
+from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.monitor import Monitor
+from custom_env.temp_control_env import TempControlEnv
 
-# Configuração para replicar experimentos
-NUM_RUNS = 5
-TOTAL_TIMESTEPS = 50000
-EVAL_EPISODES = 20
+def monitor_resources(q, process_id):
+    p = psutil.Process(process_id)
+    gpu_available = False
+    handle = None
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        gpu_available = True
+    except pynvml.NVMLError:
+        pass 
 
+    cpu_usage, gpu_usage = [], []
+    
+    while True:
+        try:
+            cpu_usage.append(p.cpu_percent(interval=1.0))
+            if gpu_available:
+                gpu_usage.append(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+            if not q.empty() and q.get() == 'stop':
+                break
+        except (psutil.NoSuchProcess, pynvml.NVMLError):
+            break 
 
-# Garante que o diretório de logs exista
-os.makedirs("logs", exist_ok=True)
+    if gpu_available:
+        pynvml.nvmlShutdown()
 
-# Cabeçalho do CSV
-csv_header = ["config", "run", "reward_mean", "reward_std", "time", "cpu_mean", "gpu_mean"]
+    cpu_mean = sum(cpu_usage) / len(cpu_usage) if cpu_usage else 0
+    gpu_mean = sum(gpu_usage) / len(gpu_usage) if gpu_usage else 0
+    q.put({'cpu_mean': cpu_mean, 'gpu_mean': gpu_mean})
 
-with open("logs/base.csv", "w", newline="") as file:
-    writer = csv.writer(file)
-    writer.writerow(csv_header)
+if __name__ == "__main__":
+    N_RUNS = 5
+    
+    CONFIG = {
+        "enable_matrix_calcs": True,
+        "enable_high_precision": True
+    }
+    
+    results = []
+    output_file = 'base_heavy_evaluation.csv' 
 
-    for run_idx in range(NUM_RUNS):
-        # Define uma seed para o experimento (para reprodutibilidade de cada run)
-        seed = 42 + run_idx
-        np.random.seed(seed)
-        random.seed(seed)
-        # Para SB3, a seed do ambiente precisa ser passada na criação ou reset
-        # PPO também tem um parâmetro 'seed'
+    for i in range(N_RUNS):
+        print(f"--- Iniciando Execução BASE (PESADO) N° {i+1}/{N_RUNS} ---")
         
-        print(f"\n--- Base Run {run_idx + 1}/{NUM_RUNS} (Seed: {seed}) ---")
-
-        env = TempControlEnv()
-        # Definir a seed para o ambiente se necessário (alguns envs têm um método .seed())
-        # No caso do gymnasium/gym, a seed é passada no reset para determinismo
-        obs, info = env.reset(seed=seed)
+        main_process = psutil.Process(os.getpid())
+        q = Queue()
         
-        model = PPO("MlpPolicy", env, verbose=0, seed=seed) # Definir seed para o modelo PPO
-
-        cpu_usages_during_train = []
-        gpu_usages_during_train = []
-
-        # Monitoramento durante o treinamento (pode ser mais granular se necessário)
-        train_start_time = start_timer()
-        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=lambda _locals, _globals: cpu_usages_during_train.append(get_cpu_usage()) or gpu_usages_during_train.append(get_gpu_usage()) or True)
-        duration = end_timer(train_start_time)
-
-        # Avaliação do agente
-        episode_rewards = []
-        for eval_episode in range(EVAL_EPISODES):
-            obs, info = env.reset(seed=seed + eval_episode) # Nova seed para avaliação
-            episode_reward = 0
-            done = False
-            truncated = False
-            while not done and not truncated:
-                action, _ = model.predict(obs, deterministic=True) # Usar modo determinístico para avaliação
-                obs, reward, done, truncated, _ = env.step(action)
-                episode_reward += reward
-            episode_rewards.append(episode_reward)
+        monitor_proc = Process(target=monitor_resources, args=(q, main_process.pid))
+        monitor_proc.start()
         
-        mean_reward = np.mean(episode_rewards)
-        std_reward = np.std(episode_rewards)
-
-        mean_cpu = np.mean(cpu_usages_during_train) if cpu_usages_during_train else 0
-        mean_gpu = np.mean(gpu_usages_during_train) if gpu_usages_during_train else 0
-
-        writer.writerow(["base", run_idx + 1, mean_reward, std_reward, duration, mean_cpu, mean_gpu])
+        start_time = time.time()
+        
+        env = Monitor(TempControlEnv(config=CONFIG))
+        
+        model = PPO("MlpPolicy", env, verbose=0)
+        model.learn(total_timesteps=20000)
+        
+        training_time = time.time() - start_time
+        
+        mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=10)
+        
+        q.put('stop')
+        resource_usage = q.get()
+        monitor_proc.join()
         env.close()
 
-print("\nBase experiments completed and logged.")
+        run_data = {
+            'config': 'base_pesado',
+            'run': i + 1,
+            'reward_mean': mean_reward,
+            'reward_std': std_reward,
+            'time': training_time,
+            'cpu_mean': resource_usage['cpu_mean'],
+            'gpu_mean': resource_usage['gpu_mean']
+        }
+        results.append(run_data)
+        print(f"Resultado da execução {i+1}: {run_data}")
+
+    df = pd.DataFrame(results)
+    df.to_csv(output_file, index=False)
+    print(f"Resultados da avaliação base (pesado) salvos em {output_file}")

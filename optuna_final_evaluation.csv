@@ -1,0 +1,2 @@
+config,reward_mean,reward_std,time,cpu_mean,gpu_mean,hyperparameters
+optuna_heavy,-35823.403265049994,661.3528689576491,282.4337377548218,45.31060070671378,0.18181818181818182,"{""learning_rate"": 0.000165950186123982, ""n_steps"": 512, ""gamma"": 0.9289601390138098, ""ent_coef"": 1.5721453392092197e-06, ""clip_range"": 0.35506853868587535, ""n_epochs"": 6}"

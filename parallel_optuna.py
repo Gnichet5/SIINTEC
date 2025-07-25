@@ -1,16 +1,16 @@
 import os
 import time
 import pandas as pd
+import json
 import psutil
 import pynvml
 from multiprocessing import Process, Queue
 from stable_baselines3 import PPO
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.monitor import Monitor # CORREÇÃO: Importação adicionada
+from stable_baselines3.common.evaluation import evaluate_policy 
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from custom_env.temp_control_env import TempControlEnv
 
-# Função de monitoramento de recursos (versão robusta)
 def monitor_resources(q, process_id):
     p = psutil.Process(process_id)
     gpu_available, handle = False, None
@@ -40,20 +40,29 @@ def make_env(env_id, rank, seed=0, config={}):
     return _init
 
 if __name__ == "__main__":
+    optuna_results_file = 'optuna_final_evaluation.csv'
+    try:
+        df_optuna = pd.read_csv(optuna_results_file)
+        hyperparams_str = df_optuna.iloc[0]['hyperparameters']
+        HYPERPARAMS = json.loads(hyperparams_str)
+        print(f"Hiperparâmetros otimizados carregados: {HYPERPARAMS}")
+    except FileNotFoundError:
+        print(f"AVISO: '{optuna_results_file}' não encontrado. Usando hiperparâmetros padrão.")
+        HYPERPARAMS = {}
+
     N_RUNS = 5
-    NUM_CPU = 4 # 
-    CONFIG = {
+    NUM_CPU = 4
         "enable_matrix_calcs": True,
         "enable_high_precision": True
     }
     
     results = []
-    output_file = 'parallel_evaluation.csv'
+    output_file = 'parallel_optuna_evaluation.csv'
 
     for i in range(N_RUNS):
-        run_seed = 42 + i 
-        print(f"[RUN {i+1}] Seed: {run_seed} - Inicializando {NUM_CPU} ambientes em paralelo...")
-
+        run_seed = 42 + i
+        print(f"--- Iniciando Execução PARALELA OTIMIZADA N° {i+1}/{N_RUNS} ---")
+        
         main_process = psutil.Process(os.getpid())
         q = Queue()
         monitor_proc = Process(target=monitor_resources, args=(q, main_process.pid))
@@ -62,16 +71,13 @@ if __name__ == "__main__":
         start_time = time.time()
         
         vec_env = SubprocVecEnv([make_env('temp-control', j, seed=run_seed, config=CONFIG) for j in range(NUM_CPU)])
-
-        model = PPO("MlpPolicy", vec_env, verbose=0, seed=run_seed)
         
-        print(f"[RUN {i+1}] Iniciando treinamento...")
+        model = PPO("MlpPolicy", vec_env, verbose=0, seed=run_seed, **HYPERPARAMS)
+        
         model.learn(total_timesteps=20000)
         
         training_time = time.time() - start_time
         
-        print(f"[RUN {i+1}] Treinamento concluído. Iniciando avaliação...")
-
         eval_env = Monitor(TempControlEnv(config=CONFIG))
         mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=10)
         
@@ -82,19 +88,19 @@ if __name__ == "__main__":
         vec_env.close()
         eval_env.close()
 
-        print(f"[RUN {i+1}] Finalizado. Média recompensa: {mean_reward:.2f} (±{std_reward:.2f})\n")
-
         run_data = {
-            'config': 'parallel_pesado',
+            'config': 'parallel_otimizada',
             'run': i + 1,
             'reward_mean': mean_reward,
             'reward_std': std_reward,
             'time': training_time,
             'cpu_mean': resource_usage['cpu_mean'],
             'gpu_mean': resource_usage['gpu_mean'],
+            'hyperparameters': json.dumps(HYPERPARAMS)
         }
         results.append(run_data)
+        print(f"Resultado da execução {i+1}: {run_data}")
 
     df = pd.DataFrame(results)
     df.to_csv(output_file, index=False)
-    print(f"Resultados da avaliação paralela salvos em {output_file}")
+    print(f"Resultados da avaliação paralela otimizada salvos em {output_file}")
